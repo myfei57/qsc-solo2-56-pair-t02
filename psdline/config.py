@@ -96,6 +96,31 @@ class QuotaSection:
 
 
 @dataclass(frozen=True)
+class DegradationSection:
+    """门机劣化评估窗口与阈值。"""
+
+    window_actions: int = 100
+    nominal_duration_s: float = 3.0
+    nominal_resistance_n: float = 300.0
+    window_max_age_s: float = 30 * 24 * 3600.0
+    min_samples: int = 12
+    required_coverage: float = 0.8
+    duration_warn_ratio: float = 1.2
+    duration_critical_ratio: float = 1.5
+    resistance_warn_ratio: float = 1.25
+    resistance_critical_ratio: float = 1.6
+    spike_resistance_n: float = 1000.0
+    lifetime_warn_actions: int = 200_000
+    lifetime_critical_actions: int = 300_000
+    watch_score: int = 35
+    degraded_score: int = 60
+    critical_score: int = 85
+    maintenance_lead_s: float = 7 * 24 * 3600.0
+    maintenance_daily_at: str = "02:00"
+    operation_timeout_s: float = 20 * 60.0
+
+
+@dataclass(frozen=True)
 class AuditSection:
     """审计流水分段。"""
 
@@ -122,6 +147,7 @@ class PlatformConfig:
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
+    degradation: DegradationSection = field(default_factory=DegradationSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
@@ -165,6 +191,42 @@ class PlatformConfig:
             raise ConfigError("序号模数固定为 65536", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
+        degradation = self.degradation
+        if degradation.window_actions <= 0:
+            raise ConfigError("劣化评估窗口动作数必须为正", component="config")
+        if degradation.nominal_duration_s <= 0 or degradation.nominal_resistance_n <= 0:
+            raise ConfigError("门机额定动作时长与阻力必须合法", component="config")
+        if degradation.window_max_age_s <= 0:
+            raise ConfigError("劣化评估窗口时长必须为正", component="config")
+        if degradation.min_samples <= 0 or degradation.min_samples > degradation.window_actions:
+            raise ConfigError("最小样本数必须为正且不大于窗口动作数", component="config")
+        if not 0 < degradation.required_coverage <= 1:
+            raise ConfigError("采样覆盖率必须落在 (0, 1]", component="config")
+        ratios = (
+            degradation.duration_warn_ratio,
+            degradation.duration_critical_ratio,
+            degradation.resistance_warn_ratio,
+            degradation.resistance_critical_ratio,
+        )
+        if any(ratio <= 1 for ratio in ratios):
+            raise ConfigError("劣化阈值倍数必须大于 1", component="config")
+        if degradation.duration_warn_ratio >= degradation.duration_critical_ratio:
+            raise ConfigError("动作时长告警阈值必须低于严重阈值", component="config")
+        if degradation.resistance_warn_ratio >= degradation.resistance_critical_ratio:
+            raise ConfigError("阻力告警阈值必须低于严重阈值", component="config")
+        if degradation.spike_resistance_n <= 0:
+            raise ConfigError("阻力尖峰阈值必须为正", component="config")
+        if degradation.lifetime_warn_actions <= 0 or degradation.lifetime_critical_actions <= degradation.lifetime_warn_actions:
+            raise ConfigError("寿命动作次数阈值必须递增且为正", component="config")
+        if not 0 < degradation.watch_score < degradation.degraded_score < degradation.critical_score <= 100:
+            raise ConfigError("劣化分值阈值必须满足 0 < watch < degraded < critical <= 100", component="config")
+        if degradation.maintenance_lead_s <= 0 or degradation.operation_timeout_s <= 0:
+            raise ConfigError("检修建议与作业超时时间必须为正", component="config")
+        hour, separator, minute = degradation.maintenance_daily_at.partition(":")
+        if not separator or not hour.isdigit() or not minute.isdigit():
+            raise ConfigError("每日检修时段必须使用 HH:MM 格式", component="config")
+        if not 0 <= int(hour) <= 23 or not 0 <= int(minute) <= 59:
+            raise ConfigError("每日检修时段超出范围", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
@@ -211,6 +273,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
+        "degradation": dict(config.degradation.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
@@ -231,6 +294,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
+        degradation=_section(DegradationSection, payload.get("degradation")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),

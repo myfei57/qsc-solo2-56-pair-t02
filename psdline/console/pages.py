@@ -130,6 +130,8 @@ def _door_page(platform: Platform) -> str:
 
     status = platform.status()
     report = status["door_report"]
+    degradation = status.get("degradation", {}).get("summary", {})
+    verdicts = status.get("degradation", {}).get("verdicts", [])
     body = _table(
         "门控总览",
         [
@@ -138,6 +140,7 @@ def _door_page(platform: Platform) -> str:
             ("批量上限", report["batch_limit"]),
             ("排队指令", report["queued"]),
             ("锁定门数", report["locked"]),
+            ("劣化摘除", ", ".join(degradation.get("excluded", [])) or "无"),
         ],
     )
     body += _table(
@@ -148,6 +151,20 @@ def _door_page(platform: Platform) -> str:
                 f"{item['station']} {item['group']} {'开' if item['open'] else '关'}{' 已锁' if item['locked'] else ''}",
             )
             for item in status["doors"][:24]
+        ]
+        or [("暂无", "-")],
+    )
+    body += _table(
+        "门机劣化",
+        [
+            (
+                item["psd_id"],
+                f"{item['status']} 评分 {item['score']} 窗口 {item['window_actions']} 次 "
+                f"累计 {item['lifetime_actions']} 次 建议 {item['suggested_window']}"
+                + (" 已摘除" if item["excluded_from_batch"] else " 待本轮后摘除" if item["pending_exclusion"] else ""),
+            )
+            for item in verdicts
+            if item["status"] in {"watch", "degraded", "critical"}
         ]
         or [("暂无", "-")],
     )

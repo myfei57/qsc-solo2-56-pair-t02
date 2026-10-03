@@ -29,6 +29,7 @@ from .door import (
     process_queue,
     queued_total,
 )
+from .degradation import DegradationRegistry, DoorAction
 from .errors import RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
@@ -75,6 +76,12 @@ from .train import (
 
 ARRIVAL = "arrival"
 DEPART = "depart"
+
+
+def _optional_number(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 class Platform:
@@ -128,9 +135,15 @@ class Platform:
         self.mappings = MappingRegistry(store)
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
+        self.degradation = DegradationRegistry(
+            store,
+            self.config.degradation,
+            self.clock,
+            audit=self.audit,
+        )
         self.commands = CommandLog(store)
         self.doors = DoorController(
-            store, self.align, self.commands, self.gates, self.lockouts
+            store, self.align, self.commands, self.gates, self.lockouts, self.degradation
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
@@ -202,6 +215,10 @@ class Platform:
                             group=group,
                         )
                     )
+                    self.degradation.register_gate(
+                        f"{station_id}-{group}-{door_index:02d}",
+                        self.clock.now(),
+                    )
         for name, limit in (
             (ARRIVAL, self.config.quota.arrival_limit),
             (DEPART, self.config.quota.depart_limit),
@@ -213,8 +230,9 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与劣化结论。"""
 
+        self.degradation.ensure_loaded()
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
@@ -428,6 +446,8 @@ class Platform:
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
         if group:
+            gate_ids = [gate.id for gate in self.gates.by_station(station_id)]
+            self.degradation.begin_operation(self._visit_operation_id(train_id, station_id), gate_ids, self.clock.now())
             open_group(self.doors, self.mappings, station_id, group)
         self.train_doors.confirm_open(train_id, self.clock.now())
         self.bus.publish(
@@ -465,11 +485,15 @@ class Platform:
             steps.append(
                 {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
             )
+        gate_ids = [gate.id for gate in self.gates.by_station(station_id)]
+        operation_id = self._visit_operation_id(train_id, station_id)
+        self.degradation.begin_operation(operation_id, gate_ids, self.clock.now())
         try:
             closed = close_and_audit(
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
             )
         except RailError as error:
+            self.degradation.end_operation(operation_id, self.clock.now())
             report = {
                 "ok": False,
                 "train_id": train_id,
@@ -479,6 +503,7 @@ class Platform:
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
+        self.degradation.end_operation(operation_id, self.clock.now())
         steps.append(
             {"component": "door", "action": "close_durable", "detail": {"train_id": train_id}}
         )
@@ -622,12 +647,80 @@ class Platform:
         )
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
+    def record_door_action(
+        self,
+        psd_id: str,
+        direction: str,
+        duration_s: float | None = None,
+        resistance_n: float | None = None,
+        event_id: str | None = None,
+        at: float | None = None,
+    ) -> dict:
+        """接收采集侧的一次已完成门动作并重新评估。"""
+
+        self.gates.require(psd_id)
+        moment = self.clock.now() if at is None else at
+        action = DoorAction(
+            event_id=event_id or self.ids.labeled("door-action"),
+            psd_id=psd_id,
+            at=moment,
+            direction=direction,
+            duration_s=duration_s,
+            resistance_n=resistance_n,
+        )
+        verdict = self.degradation.record_action(action)
+        return {"ok": True, "verdict": verdict.as_dict(), "violations": []}
+
+    def record_door_actions(self, actions: list[dict]) -> dict:
+        """批量接收采集侧门动作。"""
+
+        parsed: list[DoorAction] = []
+        for index, payload in enumerate(actions):
+            if not isinstance(payload, dict):
+                raise RailError(f"第 {index} 条门动作不是对象", component="degradation")
+            parsed.append(
+                DoorAction(
+                    event_id=str(payload.get("event_id") or self.ids.labeled(f"door-action-{index}")),
+                    psd_id=str(payload.get("psd_id", "")),
+                    at=float(payload.get("at", self.clock.now())),
+                    direction=str(payload.get("direction", "")),
+                    duration_s=_optional_number(payload.get("duration_s")),
+                    resistance_n=_optional_number(payload.get("resistance_n")),
+                )
+            )
+        result = self.degradation.record_actions(parsed)
+        return {**result, "ok": True, "violations": []}
+
+    def degradation_view(self, psd_id: str | None = None) -> dict:
+        """返回劣化评估结论；门控、联锁、控制台与审计共用这一入口。"""
+
+        if psd_id is not None:
+            verdict = self.degradation.verdict(psd_id)
+            if verdict is None:
+                return {"psd_id": psd_id, "verdict": None}
+            return {"psd_id": psd_id, "verdict": verdict.as_dict()}
+        return {
+            "summary": self.degradation.summary(),
+            "verdicts": [verdict.as_dict() for verdict in self.degradation.list_verdicts()],
+        }
+
+    def complete_door_maintenance(self, psd_id: str) -> dict:
+        """登记门机检修完成并解除摘除。"""
+
+        self.gates.require(psd_id)
+        verdict = self.degradation.complete_maintenance(psd_id, self.clock.now())
+        return {"ok": True, "verdict": verdict.as_dict(), "violations": []}
+
     def batch_open(self, station_id: str) -> dict:
         """按布局里程顺序批量开门。"""
 
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
+        gate_ids = [gate.id for gate in self.gates.by_station(station_id)]
+        operation_id = f"batch-open:{station_id}:{self.clock.now()}"
+        self.degradation.begin_operation(operation_id, gate_ids, self.clock.now())
         outcome = batch_open(self.doors, station_id, zones)
+        applied = self.degradation.end_operation(operation_id, self.clock.now())
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -635,6 +728,8 @@ class Platform:
             station_id,
             opened=len(outcome["opened"]),
             skipped=len(outcome["skipped"]),
+            excluded=sum(len(ids) for ids in outcome["excluded"].values()),
+            pending_excluded=len(applied["applied"]),
         )
         return {
             "ok": not outcome["skipped"],
@@ -643,6 +738,8 @@ class Platform:
             "opened": outcome["opened"],
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
+            "excluded": outcome["excluded"],
+            "newly_excluded": applied["applied"],
             "nearest": nearest.id if nearest else "",
             "violations": [],
         }
@@ -678,14 +775,21 @@ class Platform:
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
-        interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
+        interlock = interlock_status(
+            self.faults,
+            self.gates,
+            self.config.interlock.max_locked_ratio,
+            self.degradation.excluded_ids(),
+        )
         holding = [
             train.id
             for train in self.trains.list()
             if not self.armers.armed(train.id) and depart_policy(self.doors, train.id)["allowed"]
         ]
+        stale_operations = self.degradation.sweep_stale_operations(moment)
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
+        self.trend.append("degraded_excluded", moment, len(self.degradation.excluded_ids()))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
         self._persist()
         return {
@@ -697,6 +801,7 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "stale_degradation_operations": stale_operations["ended"],
             "violations": [],
         }
 
@@ -737,6 +842,7 @@ class Platform:
                 for gate in self.gates.list()
             ],
             "door_report": door_report(self.doors, self.namespace.station_ids()),
+            "degradation": self.degradation_view(),
             "signals": signal_summary(self.signals, ids),
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
@@ -862,6 +968,12 @@ class Platform:
 
         gates = self.gates.by_station(station_id)
         return gates[0] if gates else None
+
+    @staticmethod
+    def _visit_operation_id(train_id: str, station_id: str) -> str:
+        """返回一次到站到发车作业的稳定标识。"""
+
+        return f"visit:{train_id}:{station_id}"
 
     def _adjacent_sample(self) -> dict:
         """给快照提供一个相邻关系样例。"""

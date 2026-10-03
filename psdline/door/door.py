@@ -17,12 +17,14 @@ class DoorController:
         commands: CommandLog,
         gates: PSDRegistry,
         lockouts: LockoutRegistry,
+        degradation: object | None = None,
     ) -> None:
         self._store = store
         self._align = align
         self._commands = commands
         self._gates = gates
         self._lockouts = lockouts
+        self._degradation = degradation
         self._batch_limit = 64
         self._opens = 0
         self._closes = 0
@@ -46,6 +48,12 @@ class DoorController:
     @property
     def lockouts(self) -> LockoutRegistry:
         return self._lockouts
+
+    @property
+    def degradation(self) -> object | None:
+        """返回劣化裁决服务；未装配时门控按原行为执行。"""
+
+        return self._degradation
 
     @property
     def opens(self) -> int:

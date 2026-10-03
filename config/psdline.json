@@ -40,6 +40,27 @@
     "hold_after_fault_s": 3.0,
     "max_locked_ratio": 0.5
   },
+  "degradation": {
+    "window_actions": 100,
+    "nominal_duration_s": 3.0,
+    "nominal_resistance_n": 300.0,
+    "window_max_age_s": 2592000.0,
+    "min_samples": 12,
+    "required_coverage": 0.8,
+    "duration_warn_ratio": 1.2,
+    "duration_critical_ratio": 1.5,
+    "resistance_warn_ratio": 1.25,
+    "resistance_critical_ratio": 1.6,
+    "spike_resistance_n": 1000.0,
+    "lifetime_warn_actions": 200000,
+    "lifetime_critical_actions": 300000,
+    "watch_score": 35,
+    "degraded_score": 60,
+    "critical_score": 85,
+    "maintenance_lead_s": 604800.0,
+    "maintenance_daily_at": "02:00",
+    "operation_timeout_s": 1200.0
+  },
   "quota": {
     "arrival_limit": 1000,
     "depart_limit": 1000

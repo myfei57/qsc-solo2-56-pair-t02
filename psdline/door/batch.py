@@ -23,15 +23,29 @@ def batch_open(
     deferred = order[limit:]
     opened: list[str] = []
     skipped: dict[str, str] = {}
+    excluded: dict[str, list[str]] = {}
+    gates_by_group: dict[str, list[str]] = {}
+    for gate in controller.gates.by_station(station_id):
+        gates_by_group.setdefault(gate.group, []).append(gate.id)
+    excluded_ids = (
+        set(controller.degradation.excluded_ids()) if controller.degradation is not None else set()
+    )
     for group in scheduled:
-        gate_ids = [gate.id for gate in controller.gates.by_station(station_id) if gate.group == group]
+        gate_ids = gates_by_group.get(group, [])
         if not gate_ids:
             skipped[group] = "gate_missing"
             continue
-        if any(controller.lockouts.is_locked(gate_id) for gate_id in gate_ids):
+        locked = [gate_id for gate_id in gate_ids if controller.lockouts.is_locked(gate_id)]
+        if locked:
             skipped[group] = "locked"
             continue
-        for gate_id in gate_ids:
+        eligible_gate_ids = gate_ids
+        if excluded_ids:
+            removed = [gate_id for gate_id in gate_ids if gate_id in excluded_ids]
+            eligible_gate_ids = [gate_id for gate_id in gate_ids if gate_id not in excluded_ids]
+            if removed:
+                excluded[group] = removed
+        for gate_id in eligible_gate_ids:
             controller.gates.set_open(gate_id, True)
         opened.append(group)
     return {
@@ -40,5 +54,6 @@ def batch_open(
         "opened": opened,
         "deferred": deferred,
         "skipped": skipped,
+        "excluded": excluded,
         "limit": limit,
     }

@@ -40,6 +40,18 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise RailError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _optional_metric(body: dict, key: str) -> float | None:
+    """取出可缺失的采样值；缺失由劣化服务按覆盖率处理。"""
+
+    value = body.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise RailError(f"参数 {key!r} 必须是数值或 null", component="console") from error
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -64,6 +76,8 @@ class Api:
         add("GET", "/api/trains/{trainID}", self._train)
         add("GET", "/api/doors", lambda params, body: {"doors": self._platform.status()["doors"]})
         add("GET", "/api/doors/{psdID}", self._gate)
+        add("GET", "/api/degradation", self._degradation)
+        add("GET", "/api/degradation/{psdID}", self._degradation_gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
@@ -81,6 +95,8 @@ class Api:
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
         add("POST", "/api/batch-open", self._batch_open)
+        add("POST", "/api/door-actions", self._door_actions)
+        add("POST", "/api/maintenance/door", self._door_maintenance)
         add("POST", "/api/fault", self._fault)
         add("POST", "/api/clear-fault", self._clear_fault)
         add("POST", "/api/arm", self._arm)
@@ -134,6 +150,16 @@ class Api:
             raise RailError(f"站台门不存在: {psd_id}", component="console")
         return {"gate": gate.as_dict(), "pressure": self._platform.doors.batch_limit()}
 
+    def _degradation(self, params: dict, body: dict) -> dict:
+        return self._platform.degradation_view()
+
+    def _degradation_gate(self, params: dict, body: dict) -> dict:
+        psd_id = str(params.get("psdID", ""))
+        payload = self._platform.degradation_view(psd_id)
+        if payload["verdict"] is None:
+            raise RailError(f"门机尚无劣化结论: {psd_id}", component="console")
+        return payload
+
     def _audit(self, params: dict, body: dict) -> dict:
         entries = self._platform.audit.list()
         return {
@@ -181,6 +207,7 @@ class Api:
             "gates": bool(self._platform.gates.list()),
             "quota_arrival": self._platform.quotas.status("arrival")["configured"],
             "quota_depart": self._platform.quotas.status("depart")["configured"],
+            "degradation": self._platform.degradation is not None,
             "audit_log": self._platform.audit.journal.count() >= 0,
         }
         return {"ready": all(checks.values()), "checks": checks}
@@ -221,6 +248,21 @@ class Api:
 
     def _batch_open(self, params: dict, body: dict) -> dict:
         return self._platform.batch_open(_require(body, "station_id"))
+
+    def _door_actions(self, params: dict, body: dict) -> dict:
+        actions = body.get("actions")
+        if isinstance(actions, list):
+            return self._platform.record_door_actions(actions)
+        return self._platform.record_door_action(
+            _require(body, "psd_id"),
+            str(body.get("direction", "")),
+            _optional_metric(body, "duration_s"),
+            _optional_metric(body, "resistance_n"),
+            str(body.get("event_id", "")) or None,
+        )
+
+    def _door_maintenance(self, params: dict, body: dict) -> dict:
+        return self._platform.complete_door_maintenance(_require(body, "psd_id"))
 
     def _fault(self, params: dict, body: dict) -> dict:
         return self._platform.set_fault(_require(body, "psd_id"))

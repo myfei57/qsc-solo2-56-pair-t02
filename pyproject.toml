@@ -24,6 +24,7 @@ packages = [
     "psdline.platform",
     "psdline.gap",
     "psdline.quota",
+    "psdline.degradation",
     "psdline.audit",
     "psdline.console",
 ]
