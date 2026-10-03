@@ -32,6 +32,7 @@ from .door import (
 from .errors import RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
+from .health import ActionSample, HealthRegistry
 from .ids import IdFactory
 from .interlock import (
     FaultRegistry,
@@ -129,9 +130,17 @@ class Platform:
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
         self.commands = CommandLog(store)
+        self.health = HealthRegistry(
+            store,
+            JsonlJournal(store.root, "health", segment_limit=self.config.audit.journal_segment),
+            self.config.health,
+            self.clock,
+            self.bus,
+        )
         self.doors = DoorController(
             store, self.align, self.commands, self.gates, self.lockouts
         )
+        self.doors.attach_health(self.health)
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
         self._cycles = 0
@@ -220,6 +229,8 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        if self.health.replayed:
+            self.audit.record("health_recovered", "", "", replayed=self.health.replayed)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -635,6 +646,8 @@ class Platform:
             station_id,
             opened=len(outcome["opened"]),
             skipped=len(outcome["skipped"]),
+            health_skipped=len(outcome["health_skipped"]),
+            health_view=outcome["health_view"],
         )
         return {
             "ok": not outcome["skipped"],
@@ -643,7 +656,82 @@ class Platform:
             "opened": outcome["opened"],
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
+            "health_skipped": outcome["health_skipped"],
+            "health_view": outcome["health_view"],
             "nearest": nearest.id if nearest else "",
+            "violations": [],
+        }
+
+    # ---- 门机劣化评估 ---------------------------------------------------
+
+    def record_action(
+        self,
+        psd_id: str,
+        kind: str = "open",
+        duration_s: float | None = None,
+        resistance_peak: float | None = None,
+        samples_expected: int = 0,
+        samples_received: int = 0,
+        seq: int | None = None,
+        at: float | None = None,
+    ) -> dict:
+        """采集入口：记录一樘门的一次动作样本，返回最新评估结论。
+
+        时长缺失、阻力采样缺失都允许 —— 不合格样本会被隔离在统计之外，
+        只影响置信度与数据质量告警，不会把评估带偏。
+        """
+
+        gate = self.gates.require(psd_id)
+        sample = ActionSample(
+            psd_id=psd_id,
+            seq=self.health.next_seq(psd_id) if seq is None else int(seq),
+            at=self.clock.now() if at is None else float(at),
+            kind=kind or "open",
+            duration_s=duration_s,
+            resistance_peak=resistance_peak,
+            samples_expected=int(samples_expected),
+            samples_received=int(samples_received),
+        )
+        conclusion = self.health.record(sample)
+        if conclusion.state != conclusion.previous_state:
+            self.audit.record(
+                "health_transition",
+                "",
+                gate.station,
+                psd_id=psd_id,
+                version=conclusion.version,
+                previous=conclusion.previous_state,
+                state=conclusion.state,
+                score=conclusion.score,
+                reasons=list(conclusion.reasons),
+            )
+        return {"ok": True, "psd_id": psd_id, "conclusion": conclusion.as_dict(), "violations": []}
+
+    def record_maintenance(self, psd_id: str, note: str = "") -> dict:
+        """登记一次检修：复位评估状态并重新建立基线，历史保留在流水里。"""
+
+        gate = self.gates.require(psd_id)
+        conclusion = self.health.record_maintenance(psd_id, note, self.clock.now())
+        self.audit.record(
+            "health_maintenance",
+            "",
+            gate.station,
+            psd_id=psd_id,
+            note=note,
+            version=conclusion.version,
+        )
+        return {"ok": True, "psd_id": psd_id, "conclusion": conclusion.as_dict(), "violations": []}
+
+    def door_health(self, psd_id: str) -> dict:
+        """返回一樘门的最新结论与流水历史（供审计与控制台核对同一结论）。"""
+
+        self.gates.require(psd_id)
+        conclusion = self.health.get(psd_id)
+        return {
+            "ok": True,
+            "psd_id": psd_id,
+            "conclusion": conclusion.as_dict() if conclusion else None,
+            "history": self.health.history(psd_id)[-50:],
             "violations": [],
         }
 
@@ -737,6 +825,7 @@ class Platform:
                 for gate in self.gates.list()
             ],
             "door_report": door_report(self.doors, self.namespace.station_ids()),
+            "health": self.health.summary(),
             "signals": signal_summary(self.signals, ids),
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio

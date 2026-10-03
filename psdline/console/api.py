@@ -64,6 +64,10 @@ class Api:
         add("GET", "/api/trains/{trainID}", self._train)
         add("GET", "/api/doors", lambda params, body: {"doors": self._platform.status()["doors"]})
         add("GET", "/api/doors/{psdID}", self._gate)
+        add("GET", "/api/health", lambda params, body: self._platform.health.summary())
+        add("GET", "/api/health/{psdID}", self._health_gate)
+        add("POST", "/api/health/action", self._health_action)
+        add("POST", "/api/health/maintenance", self._health_maintenance)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
@@ -133,6 +137,36 @@ class Api:
         if gate is None:
             raise RailError(f"站台门不存在: {psd_id}", component="console")
         return {"gate": gate.as_dict(), "pressure": self._platform.doors.batch_limit()}
+
+    def _health_gate(self, params: dict, body: dict) -> dict:
+        return self._platform.door_health(str(params.get("psdID", "")))
+
+    def _health_action(self, params: dict, body: dict) -> dict:
+        optional = (
+            ("duration_s", None),
+            ("resistance_peak", None),
+            ("seq", None),
+            ("at", None),
+        )
+        values = {
+            key: (float(body[key]) if body.get(key) is not None else default)
+            for key, default in optional
+        }
+        return self._platform.record_action(
+            _require(body, "psd_id"),
+            kind=str(body.get("kind", "open")),
+            duration_s=values["duration_s"],
+            resistance_peak=values["resistance_peak"],
+            samples_expected=_as_int(body, "samples_expected", 0),
+            samples_received=_as_int(body, "samples_received", 0),
+            seq=int(values["seq"]) if values["seq"] is not None else None,
+            at=values["at"],
+        )
+
+    def _health_maintenance(self, params: dict, body: dict) -> dict:
+        return self._platform.record_maintenance(
+            _require(body, "psd_id"), str(body.get("note", ""))
+        )
 
     def _audit(self, params: dict, body: dict) -> dict:
         entries = self._platform.audit.list()

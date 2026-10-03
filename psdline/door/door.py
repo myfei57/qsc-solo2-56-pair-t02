@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..psd import LockoutRegistry, PSDRegistry
 from ..store import CommandLog, JsonStore
 from ..train import AlignRegistry
+
+if TYPE_CHECKING:  # 避免门控与劣化评估互相导入形成环
+    from ..health import HealthRegistry
 
 
 class DoorController:
@@ -23,6 +28,7 @@ class DoorController:
         self._commands = commands
         self._gates = gates
         self._lockouts = lockouts
+        self._health: HealthRegistry | None = None
         self._batch_limit = 64
         self._opens = 0
         self._closes = 0
@@ -46,6 +52,17 @@ class DoorController:
     @property
     def lockouts(self) -> LockoutRegistry:
         return self._lockouts
+
+    @property
+    def health(self) -> "HealthRegistry | None":
+        """劣化结论登记处；未接线时批量开门不做健康过滤。"""
+
+        return self._health
+
+    def attach_health(self, health: "HealthRegistry") -> None:
+        """接上劣化结论登记处，批量开门随即开始按结论摘除。"""
+
+        self._health = health
 
     @property
     def opens(self) -> int:

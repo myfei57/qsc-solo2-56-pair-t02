@@ -103,6 +103,43 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class HealthSection:
+    """门机劣化评估限值。
+
+    指标按最近 ``window_size`` 次合格动作的滑动窗口计算；寿命消耗按累计
+    动作次数对 ``rated_cycles`` 的占比计算。评分 = 水平、趋势、寿命三个
+    分量按权重求和，越过 ``warn_threshold`` 记 SUSPECT，越过
+    ``exclude_threshold`` 记 DEGRADED 并在下一轮批量开门摘除；连续
+    ``jam_consecutive`` 次出现卡阻特征直接记 CRITICAL 并立即摘除。
+    """
+
+    window_size: int = 60
+    min_window_actions: int = 20
+    baseline_actions: int = 30
+    min_completeness: float = 0.8
+    data_quality_ratio: float = 0.3
+    duration_crit_ratio: float = 1.5
+    resistance_crit_ratio: float = 1.6
+    slope_crit_per_action: float = 0.004
+    weight_level: float = 0.6
+    weight_trend: float = 0.25
+    weight_life: float = 0.15
+    warn_threshold: float = 0.4
+    exclude_threshold: float = 0.6
+    clear_threshold: float = 0.32
+    warn_consecutive: int = 3
+    exclude_consecutive: int = 2
+    clear_consecutive: int = 5
+    jam_resistance_ratio: float = 2.2
+    jam_duration_ratio: float = 2.5
+    jam_consecutive: int = 2
+    rated_cycles: int = 100000
+    life_warn_ratio: float = 0.9
+    off_peak_windows: tuple = ((1, 5),)
+    exclude_on_insufficient_data: bool = False
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +161,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    health: HealthSection = field(default_factory=HealthSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,9 +207,49 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        self._validate_health()
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
+
+    def _validate_health(self) -> None:
+        """校验劣化评估限值：阈值次序、权重归一与窗口关系。"""
+
+        health = self.health
+        if health.window_size < health.min_window_actions:
+            raise ConfigError("评估窗口长度不能小于最少合格动作数", component="config")
+        if health.min_window_actions < 2 or health.baseline_actions < 2:
+            raise ConfigError("评估窗口与基线样本数至少为 2", component="config")
+        if not 0 < health.min_completeness <= 1:
+            raise ConfigError("采样完整度下限必须落在 (0, 1]", component="config")
+        if not 0 <= health.data_quality_ratio <= 1:
+            raise ConfigError("数据质量告警比例必须落在 [0, 1]", component="config")
+        if health.duration_crit_ratio <= 1 or health.resistance_crit_ratio <= 1:
+            raise ConfigError("时长/阻力临界比值必须大于 1", component="config")
+        if health.slope_crit_per_action <= 0:
+            raise ConfigError("趋势临界斜率必须为正", component="config")
+        if abs(health.weight_level + health.weight_trend + health.weight_life - 1.0) > 1e-6:
+            raise ConfigError("评分权重之和必须等于 1", component="config")
+        if not 0 < health.clear_threshold < health.warn_threshold < health.exclude_threshold <= 1:
+            raise ConfigError("评估阈值必须满足 0 < 清除 < 预警 < 摘除 ≤ 1", component="config")
+        if health.jam_resistance_ratio <= health.resistance_crit_ratio:
+            raise ConfigError("卡阻阻力比值必须大于阻力临界比值", component="config")
+        if health.jam_duration_ratio <= health.duration_crit_ratio:
+            raise ConfigError("卡阻时长比值必须大于时长临界比值", component="config")
+        if min(
+            health.warn_consecutive,
+            health.exclude_consecutive,
+            health.clear_consecutive,
+            health.jam_consecutive,
+        ) < 1:
+            raise ConfigError("滞回计数必须为正", component="config")
+        if health.rated_cycles <= 0:
+            raise ConfigError("额定动作次数必须为正", component="config")
+        if not 0 < health.life_warn_ratio <= 1:
+            raise ConfigError("寿命告警比例必须落在 (0, 1]", component="config")
+        for window in health.off_peak_windows:
+            if len(window) != 2 or not 0 <= window[0] < window[1] <= 24:
+                raise ConfigError("低谷检修窗口必须是合法的 [起, 止) 小时段", component="config")
 
 
 def default_config() -> PlatformConfig:
@@ -189,6 +267,10 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is HealthSection and "off_peak_windows" in kwargs:
+        kwargs["off_peak_windows"] = tuple(
+            tuple(int(hour) for hour in window) for window in kwargs["off_peak_windows"]
+        )
     return cls(**kwargs)
 
 
@@ -213,6 +295,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "health": dict(config.health.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +316,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        health=_section(HealthSection, payload.get("health")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

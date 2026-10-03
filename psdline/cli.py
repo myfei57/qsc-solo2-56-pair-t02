@@ -84,6 +84,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)
     departure = platform.depart(args.train, args.station)
+    health = _demo_health(platform, args.station)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
 
@@ -110,6 +111,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "dwell": dwell,
         "route": route,
         "departure": departure,
+        "health": health,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
@@ -141,6 +143,36 @@ def _mirror_mapping(platform: Platform, station_id: str) -> dict[str, str]:
     groups = sorted(platform.station_view(station_id)["groups"])
     rotated = groups[1:] + groups[:1]
     return {key: value for key, value in zip(groups, rotated)}
+
+
+def _demo_health(platform: Platform, station_id: str) -> dict:
+    """演示劣化评估：让一樘门的动作时长逐渐劣化，直到被批量开门摘除。"""
+
+    gate_id = _first_gate(platform, station_id)
+    conclusion: dict = {}
+    for seq in range(1, 86):
+        # 前 30 次建立基线，之后时长每次劣化 1.5%，封顶 1.8 倍（不触发卡阻）。
+        ratio = min(1.015 ** max(0, seq - 30), 1.8)
+        result = platform.record_action(
+            gate_id,
+            duration_s=round(12.0 * ratio, 3),
+            resistance_peak=1.0,
+            samples_expected=10,
+            samples_received=10,
+            seq=seq,
+        )
+        conclusion = result["conclusion"]
+    batched = platform.batch_open(station_id)
+    maintained = platform.record_maintenance(gate_id, "demo")
+    return {
+        "gate": gate_id,
+        "state": conclusion.get("state"),
+        "score": conclusion.get("score"),
+        "reasons": conclusion.get("reasons"),
+        "advice": conclusion.get("advice"),
+        "batch_health_skipped": batched["health_skipped"],
+        "after_maintenance": maintained["conclusion"]["state"],
+    }
 
 
 def _first_gate(platform: Platform, station_id: str) -> str:
